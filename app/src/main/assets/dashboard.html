@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seestar Proxy</title>
+<style>
+  :root { --bg:#0b1426; --card:#13203a; --fg:#e6ecf5; --dim:#8da2c0; --ok:#4caf50; --bad:#e57373;
+          --tx:#64b5f6; --rx:#81c784; --evt:#ffb74d; --img:#ba68c8; --err:#ef5350; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px; font-size:20px; font-weight:600; }
+  main { padding:0 16px 24px; display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); }
+  .card { background:var(--card); border-radius:12px; padding:14px; }
+  .card h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .row { display:flex; justify-content:space-between; padding:2px 0; }
+  .row span:last-child { font-variant-numeric:tabular-nums; font-weight:600; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; background:var(--bad); }
+  .dot.up { background:var(--ok); }
+  #log { grid-column:1/-1; }
+  #entries { font:12px/1.5 ui-monospace, monospace; max-height:60vh; overflow:auto; }
+  .e { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+  .e.open { white-space:pre-wrap; word-break:break-all; }
+  .ctrl-tx,.img-tx { color:var(--tx); } .ctrl-rx { color:var(--rx); } .ctrl-evt { color:var(--evt); }
+  .img { color:var(--img); } .err { color:var(--err); } .sys { color:var(--dim); }
+  #conn { font-size:12px; color:var(--dim); font-weight:400; margin-left:8px; }
+</style>
+</head>
+<body>
+<header>Seestar Proxy <span id="conn">łączenie…</span></header>
+<main>
+  <section class="card"><h2>Połączenia</h2>
+    <div class="row"><span><i class="dot" id="cu"></i>Sterowanie (4700)</span><span id="cc">–</span></div>
+    <div class="row"><span><i class="dot" id="iu"></i>Obraz (4800)</span><span id="ic">–</span></div>
+    <div class="row"><span>Teleskop</span><span id="up">–</span></div>
+    <div class="row"><span>Czas pracy</span><span id="ut">–</span></div>
+  </section>
+  <section class="card"><h2>Ruch</h2>
+    <div class="row"><span>Żądania klientów</span><span id="tx">–</span></div>
+    <div class="row"><span>Odpowiedzi</span><span id="rx">–</span></div>
+    <div class="row"><span>Zdarzenia</span><span id="ev">–</span></div>
+    <div class="row"><span>Klatki obrazu</span><span id="fr">–</span></div>
+    <div class="row"><span>Dane obrazu</span><span id="by">–</span></div>
+  </section>
+  <section class="card"><h2>Teleskop</h2>
+    <div class="row"><span>Bateria</span><span id="bat">–</span></div>
+    <div class="row"><span>Temperatura</span><span id="tmp">–</span></div>
+    <div class="row"><span>Stackowanie</span><span id="stk">–</span></div>
+    <div class="row"><span>Śledzenie</span><span id="trk">–</span></div>
+    <div class="row"><span>Tryb widoku</span><span id="vm">–</span></div>
+    <div class="row"><span>Ostatnie zdarzenie</span><span id="le">–</span></div>
+  </section>
+  <section class="card" id="wg" hidden><h2>WireGuard — zdalny dostęp</h2>
+    <div class="row"><span><i class="dot" id="wgs"></i>Sesja</span><span id="wgp">–</span></div>
+    <div class="row"><span>Endpoint</span><span id="wge">–</span></div>
+    <div class="row"><span>Ostatni handshake</span><span id="wgh">–</span></div>
+    <div class="row"><span>Odebrano / wysłano</span><span id="wgt">–</span></div>
+    <div class="row"><span>Połączenia w tunelu</span><span id="wgc">–</span></div>
+    <div id="wgqr" style="max-width:260px;margin:10px auto 0"></div>
+    <p style="font-size:12px;color:var(--dim);text-align:center;margin:6px 0 0">Zeskanuj w aplikacji WireGuard</p>
+  </section>
+  <section class="card" id="log"><h2>Log ruchu</h2><div id="entries"></div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmtBytes = b => b > 1073741824 ? (b/1073741824).toFixed(2)+' GB' : (b/1048576).toFixed(1)+' MB';
+const fmtUp = s => { const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return h+'h '+m+'m '+(s%60)+'s'; };
+const MAX = 300;
+
+function render(d) {
+  $('cu').classList.toggle('up', d.control.upstream_up);
+  $('iu').classList.toggle('up', d.imaging.upstream_up);
+  $('cc').textContent = d.control.clients + ' klient.';
+  $('ic').textContent = d.imaging.clients + ' klient.';
+  $('up').textContent = d.upstream || '–';
+  $('ut').textContent = fmtUp(d.uptime_s);
+  $('tx').textContent = d.control.tx; $('rx').textContent = d.control.rx;
+  $('ev').textContent = d.control.events; $('fr').textContent = d.imaging.frames;
+  $('by').textContent = fmtBytes(d.imaging.bytes);
+  const t = d.telescope;
+  $('bat').textContent = t.battery != null ? t.battery + '%' + (t.charger_status ? ' ('+t.charger_status+')' : '') : '–';
+  $('tmp').textContent = t.temperature != null ? t.temperature.toFixed(1) + ' °C' : '–';
+  $('stk').textContent = t.is_stacking ? 'tak (' + t.stack_count + ')' : 'nie';
+  $('trk').textContent = t.tracking ? 'tak' : 'nie';
+  $('vm').textContent = t.view_mode || '–';
+  $('le').textContent = t.last_event || '–';
+
+  const w = d.wireguard;
+  if (w) {
+    $('wgs').classList.toggle('up', w.session);
+    $('wgp').textContent = w.peer || 'brak';
+    $('wge').textContent = w.endpoint;
+    $('wgh').textContent = w.last_handshake_ms ? Math.round((Date.now() - w.last_handshake_ms) / 1000) + ' s temu' : 'nigdy';
+    $('wgt').textContent = fmtBytes(w.rx_bytes) + ' / ' + fmtBytes(w.tx_bytes);
+    $('wgc').textContent = w.tunnel_connections;
+  }
+
+  const box = $('entries');
+  for (const e of d.log) {
+    const div = document.createElement('div');
+    div.className = 'e ' + e.channel;
+    const time = new Date(e.ts).toLocaleTimeString();
+    div.textContent = time + '  ' + e.channel.padEnd(8) + ' ' + e.summary;
+    if (e.payload) {
+      div.title = 'Kliknij, aby pokazać treść';
+      div.onclick = () => {
+        const open = div.classList.toggle('open');
+        div.textContent = time + '  ' + e.channel.padEnd(8) + ' ' + e.summary + (open ? '\n' + e.payload : '');
+      };
+    }
+    box.prepend(div);
+  }
+  while (box.childElementCount > MAX) box.lastElementChild.remove();
+}
+
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => $('conn').textContent = 'na żywo';
+  es.onmessage = m => render(JSON.parse(m.data));
+  es.onerror = () => { $('conn').textContent = 'rozłączono — ponawiam…'; es.close(); setTimeout(connect, 3000); };
+}
+connect();
+fetch('/api/wireguard').then(r => r.json()).then(w => {
+  if (!w.enabled) return;
+  $('wg').hidden = false;
+  $('wgqr').innerHTML = w.qr_svg;
+}).catch(() => {});
+</script>
+</body>
+</html>

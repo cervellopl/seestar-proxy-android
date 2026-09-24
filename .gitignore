@@ -1,0 +1,19 @@
+# Gradle / Android Studio
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Built artifacts (published as GitHub releases instead)
+*.apk
+*.aab
+
+# OS
+.DS_Store
+Thumbs.db
