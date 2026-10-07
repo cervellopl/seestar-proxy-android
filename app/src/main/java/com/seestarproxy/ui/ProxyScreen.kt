@@ -6,6 +6,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import com.seestarproxy.TelescopeNetwork
+import com.seestarproxy.proxy.NetBinder
 import com.seestarproxy.proxy.ProxyEngine
 import com.seestarproxy.wg.WgInfo
 import com.seestarproxy.wg.WireGuardServer
@@ -96,6 +98,7 @@ private data class Snapshot(
     val log: List<LogEntry> = emptyList(),
     val recordingDir: String? = null,
     val wg: WgSnapshot? = null,
+    val telescopeNetwork: String? = null,
 )
 
 private data class WgSnapshot(
@@ -143,6 +146,7 @@ fun ProxyScreen(onOpenUrl: (String) -> Unit, onShare: (String) -> Unit) {
                     telescope = m.telescopeStatus(),
                     log = m.logSince(null).takeLast(80).reversed(),
                     recordingDir = eng.recorder?.dir?.absolutePath,
+                    telescopeNetwork = eng.net.description,
                     wg = eng.wireguard?.let { w ->
                         WgSnapshot(
                             session = w.peer.hasSession,
@@ -183,7 +187,17 @@ fun ProxyScreen(onOpenUrl: (String) -> Unit, onShare: (String) -> Unit) {
                     scanning = true
                     scope.launch {
                         try {
-                            scanResults = withContext(Dispatchers.IO) { TelescopeScanner.scan() }
+                            scanResults = withContext(Dispatchers.IO) {
+                                // Scan over the Wi‑Fi even when it has no internet (telescope's own AP).
+                                val net = if (config.pinTelescopeWifi) {
+                                    TelescopeNetwork(ctx, null).also { it.start(); it.awaitReady(1_500) }
+                                } else null
+                                try {
+                                    TelescopeScanner.scan(net = net ?: NetBinder.DEFAULT)
+                                } finally {
+                                    net?.stop()
+                                }
+                            }
                         } catch (e: Exception) {
                             scanError = e.message ?: e.javaClass.simpleName
                         } finally {
@@ -328,6 +342,7 @@ private fun StatusCard(
                     t.viewMode?.let { add("Tryb: $it") }
                 }
                 if (parts.isNotEmpty()) Text(parts.joinToString(" • "), style = MaterialTheme.typography.bodyMedium)
+                s.telescopeNetwork?.let { Text("Ruch do teleskopu: $it", style = MaterialTheme.typography.bodySmall) }
                 s.recordingDir?.let { Text("Nagrywanie: $it", style = MaterialTheme.typography.bodySmall) }
                 if (config.dashboardPort > 0) {
                     OutlinedButton(onClick = { onOpenUrl("http://127.0.0.1:${config.dashboardPort}/") }) {
@@ -390,8 +405,30 @@ private fun ConfigCard(
                     }
                 }
             }
+            SwitchRow("Wi‑Fi teleskopu także bez internetu", config.pinTelescopeWifi, enabled) {
+                onChange(config.copy(pinTelescopeWifi = it))
+            }
+            Text(
+                "Ruch do teleskopu idzie przez Wi‑Fi, w którego podsieci jest teleskop (np. jego własny hotspot S50_…), " +
+                    "nawet gdy internet i VPN działają przez dane komórkowe.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             SwitchRow("Mostek discovery (UDP 4720)", config.discovery, enabled) {
                 onChange(config.copy(discovery = it))
+            }
+            if (config.discovery) {
+                OutlinedTextField(
+                    value = config.announceTargets,
+                    onValueChange = { onChange(config.copy(announceTargets = it)) },
+                    label = { Text("Ogłaszaj teleskop do adresów (opcjonalnie)") },
+                    placeholder = { Text("np. 192.168.30.255, 192.168.30.12") },
+                    supportingText = {
+                        Text("Dla sieci, w których broadcast nie dociera (VPN, np. SoftEther/OpenVPN): adresy klientów " +
+                            "lub adres rozgłoszeniowy podsieci VPN. Co 3 s.")
+                    },
+                    enabled = enabled, modifier = Modifier.fillMaxWidth(),
+                )
             }
             SwitchRow("Nagrywaj ruch (sesja do odtwarzania)", config.record, enabled) {
                 onChange(config.copy(record = it))

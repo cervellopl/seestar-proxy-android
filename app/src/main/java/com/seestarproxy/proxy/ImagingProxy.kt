@@ -27,6 +27,10 @@ class ImagingProxy(
     private val upstream: InetSocketAddress,
     private val metrics: Metrics,
     private val recorder: Recorder?,
+    /** Network that carries traffic to the telescope. */
+    private val net: NetBinder = NetBinder.DEFAULT,
+    /** Notified with each client address (used for discovery announcements). */
+    private val onClient: (java.net.InetAddress) -> Unit = {},
 ) {
     private val running = AtomicBoolean(true)
     private val clients = CopyOnWriteArrayList<Client>()
@@ -66,6 +70,7 @@ class ImagingProxy(
             val addr = sock.remoteSocketAddress.toString().trimStart('/')
             metrics.info("Klient obrazu połączony: $addr")
             val client = Client(sock, addr)
+            onClient(sock.inetAddress)
             clients.add(client)
             metrics.imagingClients.incrementAndGet()
             thread(name = "img-client-$addr", isDaemon = true) {
@@ -150,6 +155,7 @@ class ImagingProxy(
             metrics.info("Łączenie z obrazem teleskopu $upstream…")
             val sock = Socket()
             try {
+                net.bind(sock)
                 sock.connect(upstream, 10_000)
                 sock.tcpNoDelay = true
                 sock.keepAlive = true

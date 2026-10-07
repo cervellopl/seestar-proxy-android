@@ -13,6 +13,7 @@ It lets several apps use one Seestar telescope at the same time. Your phone acts
 | Web dashboard (`/`, `/api/stats`, `/api/stream` SSE) | TCP 4090 | ✅ |
 | Traffic recording (`control.jsonl`, `frames/*.bin`, `manifest.json`, same format as the original) | – | ✅ |
 | Telescope scan on the LAN | – | ✅ (Android addition) |
+| Telescope on a no-internet Wi‑Fi alongside a VPN (pinning, per-client discovery address, announcements) | – | ✅ (Android addition) |
 | Embedded WireGuard endpoint (remote access, QR code, DNS `seestar.local`, discovery, ping in the tunnel) | UDP 51820 | ✅ |
 | Tailscale / Lua hooks / NTP / transparent / replay | – | ❌ not ported |
 
@@ -28,6 +29,21 @@ The proxy runs as a foreground service with a notification and holds wake, Wi‑
 4. Dashboard: `http://<phone-IP>:4090/`.
 
 Recordings go to `Android/data/com.seestarproxy/files/recordings/`.
+
+## Phone on the Seestar's own Wi‑Fi + VPN (e.g. SoftEther)
+
+Setup: the proxy phone joins the telescope's access point (`S50_xxxx`, no internet) while mobile data carries the internet and a VPN (e.g. OpenVPN to a SoftEther server). Remote users on the VPN connect to the phone's VPN address.
+
+- **Telescope Wi‑Fi even without internet** (on by default): Android normally sends traffic over mobile data when the Wi‑Fi has no internet. The proxy keeps that Wi‑Fi up (`requestNetwork`) and pins all telescope‑bound sockets to it, but only when the telescope is inside that Wi‑Fi's subnet, so a telescope on the phone's hotspot still works. The status shows which network is used, and at startup the proxy checks whether the telescope is reachable.
+- **Discovery** answers each request with the proxy address **as seen from the requester**: the Wi‑Fi address for LAN clients, the VPN address for clients coming through the VPN.
+- **Announce to addresses**: routed VPNs (OpenVPN in tun mode) usually don't carry broadcasts. Enter the VPN clients' addresses or the VPN subnet's broadcast address, and the proxy will announce the telescope there every 3 s. Remote clients it has already seen get announcements automatically.
+
+VPN setup tips:
+- SoftEther has no Android client. Export an OpenVPN profile from SoftEther and use the OpenVPN app (Android 12+ dropped the built‑in L2TP).
+- Use a **split tunnel**: don't route everything through the VPN (in OpenVPN for Android, untick "Use default route", or don't push a default gateway from SoftEther). With a full tunnel, Android may refuse to send traffic to the telescope Wi‑Fi unless the VPN allows apps to bypass it; the app then shows a message in the log.
+- The VPN subnet must not overlap the telescope's subnet.
+
+Tested on the emulator: with the Wi‑Fi marked "no internet" and mobile data as the default network, pinned connections leave from the Wi‑Fi address, while unpinned ones leave from the mobile data address (i.e. the wrong way). Announcements arrive every 3 s with the address seen from the client's side. A real phone + Seestar + SoftEther setup has not been tested yet.
 
 ## WireGuard (remote access)
 

@@ -55,6 +55,8 @@ class WireGuardServer(
     /** Tunnel TCP port → local proxy port. */
     private val portMap: Map<Int, Int>,
     private val metrics: Metrics,
+    /** Network that carries traffic to the telescope. */
+    private val net: com.seestarproxy.proxy.NetBinder = com.seestarproxy.proxy.NetBinder.DEFAULT,
 ) {
     private val running = AtomicBoolean(true)
     private lateinit var socket: DatagramSocket
@@ -125,7 +127,7 @@ class WireGuardServer(
         val json = if (telescopeSn != null) {
             DiscoveryBridge.buildConfiguredResponse(telescopeSn, telescopeModel, null, upstreamIp.hostAddress!!)
         } else {
-            DiscoveryBridge.fetchDeviceInfoTcp(upstreamIp, Protocol.CONTROL_PORT) ?: DiscoveryBridge.fallbackResponse()
+            DiscoveryBridge.fetchDeviceInfoTcp(upstreamIp, Protocol.CONTROL_PORT, net) ?: DiscoveryBridge.fallbackResponse()
         }
         json.optJSONObject("result")?.put("ip", upstreamIp.hostAddress)
         deviceInfo = json.toString().toByteArray()

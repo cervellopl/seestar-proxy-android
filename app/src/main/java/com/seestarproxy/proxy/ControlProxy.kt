@@ -29,6 +29,10 @@ class ControlProxy(
     private val upstream: InetSocketAddress,
     private val metrics: Metrics,
     private val recorder: Recorder?,
+    /** Network that carries traffic to the telescope. */
+    private val net: NetBinder = NetBinder.DEFAULT,
+    /** Notified with each client address (used for discovery announcements). */
+    private val onClient: (java.net.InetAddress) -> Unit = {},
 ) {
     private class Pending(val client: Client, val originalId: Any)
 
@@ -82,6 +86,7 @@ class ControlProxy(
             }
 
             val client = Client(sock, addr)
+            onClient(sock.inetAddress)
             clients.add(client)
             metrics.controlClients.incrementAndGet()
             thread(name = "ctrl-client-$addr", isDaemon = true) {
@@ -206,6 +211,7 @@ class ControlProxy(
             metrics.info("Łączenie ze sterowaniem teleskopu $upstream…")
             val s = Socket()
             try {
+                net.bind(s)
                 s.connect(upstream, 10_000)
                 s.tcpNoDelay = true
                 s.keepAlive = true

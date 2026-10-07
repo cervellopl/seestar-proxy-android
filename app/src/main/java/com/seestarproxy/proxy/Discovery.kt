@@ -10,17 +10,12 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 private val BROADCAST: InetAddress = InetAddress.getByName("255.255.255.255")
-
-/** Local IPv4 address the OS would use to reach [target]. */
-fun localIpFor(target: InetAddress): InetAddress =
-    DatagramSocket().use {
-        it.connect(target, 1)
-        it.localAddress
-    }
 
 /** All non-loopback IPv4 addresses of this device, with their interface names. */
 fun localIpv4Addresses(): List<Pair<String, String>> = try {
@@ -55,7 +50,15 @@ fun scanProbe(localIp: String): ByteArray = JSONObject().apply {
  * 1. Captures the telescope's device info (UDP probe → TCP `get_device_state`
  *    fallback → minimal stub), or builds it from the configured serial number.
  * 2. Answers client `scan_iscope` probes with that info, with `ip` replaced by
- *    the proxy's own address so apps connect to the proxy.
+ *    the proxy's address *as seen from the requester* — the Wi‑Fi address for
+ *    LAN clients, the VPN address for clients coming through a VPN.
+ * 3. Every 3 s sends the same answer unsolicited to [announceTargets] and to
+ *    remote clients it has seen, for networks where broadcasts don't arrive
+ *    (e.g. routed OpenVPN/SoftEther).
+ *
+ * Two sockets share the port: [clientSock] (0.0.0.0, normal routing incl.
+ * VPN) and [scopeSock] (telescope-side address, pinned to [net]) which talks
+ * to the telescope, whose replies are addressed to it.
  */
 class DiscoveryBridge(
     private val upstreamIp: InetAddress,
@@ -63,9 +66,20 @@ class DiscoveryBridge(
     private val telescopeModel: String?,
     private val telescopeBssid: String?,
     private val metrics: Metrics,
+    private val net: NetBinder = NetBinder.DEFAULT,
+    private val announceTargets: List<InetAddress> = emptyList(),
+    private val port: Int = Protocol.DISCOVERY_PORT,
+    /** Port the client apps listen on for announcements. */
+    private val announcePort: Int = Protocol.DISCOVERY_PORT,
 ) {
     private val running = AtomicBoolean(true)
-    @Volatile private var socket: DatagramSocket? = null
+    private val sockets = CopyOnWriteArrayList<DatagramSocket>()
+    @Volatile private var clientSock: DatagramSocket? = null
+    @Volatile private var scopeSock: DatagramSocket? = null
+    @Volatile private var deviceInfo: JSONObject = fallbackResponse()
+    @Volatile private var haveRealInfo = false
+    /** Remote clients (not on the telescope network) that get periodic announcements. */
+    private val seenClients = ConcurrentHashMap.newKeySet<InetAddress>()
 
     fun start() {
         thread(name = "discovery", isDaemon = true) {
@@ -79,27 +93,47 @@ class DiscoveryBridge(
 
     fun stop() {
         running.set(false)
-        socket.closeQuietly()
+        sockets.forEach { it.closeQuietly() }
+    }
+
+    /** Called by the control/imaging proxies so remote clients also get announcements. */
+    fun noteClient(addr: InetAddress) {
+        if (addr.isLoopbackAddress || addr.isAnyLocalAddress || addr == upstreamIp || net.owns(addr)) return
+        if (addr !is Inet4Address || seenClients.size >= MAX_SEEN) return
+        seenClients.add(addr)
     }
 
     private fun run() {
-        var deviceInfo = if (telescopeSn != null) {
+        deviceInfo = if (telescopeSn != null) {
             metrics.info("Discovery: skonfigurowana tożsamość sn=$telescopeSn")
             buildConfiguredResponse(telescopeSn, telescopeModel, telescopeBssid, "0.0.0.0")
         } else {
             probeUpstream()
         }
         if (!running.get()) return
+        haveRealInfo = deviceInfo.optJSONObject("result")?.opt("sn").let { it is String && it != "proxy" }
+        metrics.info("Discovery: dane urządzenia: ${deviceInfo.toString().clip(200)}")
 
-        val proxyIp = localIpFor(upstreamIp).hostAddress!!
-        deviceInfo.optJSONObject("result")?.put("ip", proxyIp)
-        var haveRealInfo = deviceInfo.optJSONObject("result")?.opt("sn").let { it is String && it != "proxy" }
-        metrics.info("Discovery: dane urządzenia (ip → $proxyIp): ${deviceInfo.toString().clip(200)}")
+        val client = reusableUdpSocket(InetSocketAddress(port)).also { sockets.add(it) }
+        clientSock = client
+        // Telescope-side socket: the telescope only answers probes from port 4720 and
+        // sends its reply to the address we probed from, which is this socket.
+        scopeSock = try {
+            val local = localIpFor(upstreamIp, net)
+            if (local.isAnyLocalAddress) null
+            else reusableUdpSocket(InetSocketAddress(local, port)).also { net.bind(it); sockets.add(it) }
+        } catch (e: IOException) {
+            metrics.error("Discovery: gniazdo po stronie teleskopu niedostępne: ${e.message}")
+            null
+        }
+        metrics.info("Discovery: nasłuch UDP na porcie $port")
 
-        val sock = reusableUdpSocket(InetSocketAddress(Protocol.DISCOVERY_PORT))
-        socket = sock
-        metrics.info("Discovery: nasłuch UDP na porcie ${Protocol.DISCOVERY_PORT}")
+        scopeSock?.let { s -> thread(name = "discovery-scope", isDaemon = true) { receiveLoop(s) } }
+        thread(name = "discovery-announce", isDaemon = true) { announceLoop() }
+        receiveLoop(client)
+    }
 
+    private fun receiveLoop(sock: DatagramSocket) {
         val buf = ByteArray(16_384)
         while (running.get()) {
             val packet = DatagramPacket(buf, buf.size)
@@ -109,41 +143,86 @@ class DiscoveryBridge(
                 if (running.get()) metrics.error("Discovery: błąd odbioru: ${e.message}")
                 return
             }
-            val text = String(packet.data, 0, packet.length, Charsets.UTF_8).trim()
-            val request = try {
-                JSONObject(text)
-            } catch (_: Exception) {
-                continue
-            }
-            if (request.optString("method") != "scan_iscope") continue
-
-            // A packet with "result"/"code" is a discovery *response*, not a probe.
-            if (request.has("result") || request.has("code")) {
-                if (packet.address == upstreamIp && !haveRealInfo) {
-                    request.optJSONObject("result")?.put("ip", proxyIp)
-                    deviceInfo = request
-                    haveRealInfo = true
-                    metrics.info("Discovery: zaktualizowano dane z teleskopu, sn=${request.optJSONObject("result")?.optString("sn")}")
-                }
-                continue // our own broadcast echoes and other responses
-            }
-
-            metrics.info("Discovery: zapytanie od ${packet.address.hostAddress}")
-            val response = deviceInfo.toString().toByteArray()
             try {
-                // Unicast back to the requester…
-                sock.send(DatagramPacket(response, response.size, packet.socketAddress))
-                // …and broadcast so apps on this same device see it on the physical interface.
-                sock.send(DatagramPacket(response, response.size, BROADCAST, Protocol.DISCOVERY_PORT))
-            } catch (e: IOException) {
-                metrics.error("Discovery: nie wysłano odpowiedzi: ${e.message}")
+                handle(packet)
+            } catch (e: Exception) {
+                metrics.error("Discovery: ${e.message}")
             }
+        }
+    }
 
-            // Still on the fallback? Ask the telescope again; its reply lands on this socket.
-            if (!haveRealInfo) {
-                val probe = scanProbe(proxyIp)
+    private fun handle(packet: DatagramPacket) {
+        val text = String(packet.data, 0, packet.length, Charsets.UTF_8).trim()
+        val request = try {
+            JSONObject(text)
+        } catch (_: Exception) {
+            return
+        }
+        if (request.optString("method") != "scan_iscope") return
+
+        // A packet with "result"/"code" is a discovery *response*, not a probe.
+        if (request.has("result") || request.has("code")) {
+            if (packet.address == upstreamIp && !haveRealInfo) {
+                deviceInfo = request
+                haveRealInfo = true
+                metrics.info("Discovery: zaktualizowano dane z teleskopu, sn=${request.optJSONObject("result")?.optString("sn")}")
+            }
+            return // our own broadcast echoes and other responses
+        }
+
+        val src = packet.address
+        val proxyIp = localIpFor(src, net).hostAddress!!
+        metrics.info("Discovery: zapytanie od ${src.hostAddress} → odpowiadam adresem $proxyIp")
+        noteClient(src)
+        val response = infoFor(proxyIp)
+        val out = replySocketFor(src)
+        try {
+            // Unicast back to the requester…
+            out?.send(DatagramPacket(response, response.size, packet.socketAddress))
+            // …and broadcast so apps on this same device see it on the physical interface.
+            out?.send(DatagramPacket(response, response.size, BROADCAST, port))
+        } catch (e: IOException) {
+            metrics.error("Discovery: nie wysłano odpowiedzi: ${e.message}")
+        }
+
+        // Still on the fallback? Ask the telescope again; its reply lands on scopeSock.
+        if (!haveRealInfo) {
+            val s = scopeSock ?: clientSock ?: return
+            try {
+                val probe = scanProbe(localIpFor(upstreamIp, net).hostAddress!!)
+                s.send(DatagramPacket(probe, probe.size, upstreamIp, Protocol.DISCOVERY_PORT))
+            } catch (_: IOException) {
+            }
+        }
+    }
+
+    /** Requesters on the telescope's Wi‑Fi must be answered over that Wi‑Fi. */
+    private fun replySocketFor(addr: InetAddress) =
+        if (net.owns(addr)) scopeSock ?: clientSock else clientSock
+
+    private fun infoFor(proxyIp: String): ByteArray {
+        val copy = JSONObject(deviceInfo.toString())
+        copy.optJSONObject("result")?.put("ip", proxyIp)
+        return copy.toString().toByteArray()
+    }
+
+    private fun announceLoop() {
+        var lastLogged = emptySet<InetAddress>()
+        while (running.get()) {
+            try {
+                Thread.sleep(ANNOUNCE_INTERVAL_MS)
+            } catch (_: InterruptedException) {
+                return
+            }
+            val targets = (announceTargets + seenClients).toSet()
+            if (targets != lastLogged && targets.isNotEmpty()) {
+                metrics.info("Discovery: ogłaszam teleskop do ${targets.joinToString { it.hostAddress ?: "?" }}")
+                lastLogged = targets
+            }
+            for (t in targets) {
                 try {
-                    sock.send(DatagramPacket(probe, probe.size, upstreamIp, Protocol.DISCOVERY_PORT))
+                    val data = infoFor(localIpFor(t, net).hostAddress!!)
+                    replySocketFor(t)?.send(DatagramPacket(data, data.size, t, announcePort))
                 } catch (_: IOException) {
                 }
             }
@@ -152,10 +231,11 @@ class DiscoveryBridge(
 
     /** UDP probe to the telescope, falling back to TCP `get_device_state`, then a stub. */
     private fun probeUpstream(): JSONObject {
-        val localIp = localIpFor(upstreamIp)
         try {
-            reusableUdpSocket(InetSocketAddress(localIp, Protocol.DISCOVERY_PORT)).use { s ->
-                socket = s
+            val localIp = localIpFor(upstreamIp, net)
+            reusableUdpSocket(InetSocketAddress(localIp, port)).use { s ->
+                net.bind(s)
+                sockets.add(s)
                 val probe = scanProbe(localIp.hostAddress!!)
                 s.send(DatagramPacket(probe, probe.size, BROADCAST, Protocol.DISCOVERY_PORT))
                 metrics.info("Discovery: wysłano sondę scan_iscope, czekam 5 s na teleskop")
@@ -181,24 +261,25 @@ class DiscoveryBridge(
                         // Otherwise an echo of someone else's odd probe — keep waiting.
                     }
                 }
+                sockets.remove(s)
             }
         } catch (e: IOException) {
             metrics.error("Discovery: sonda UDP nieudana: ${e.message}")
-        } finally {
-            socket = null
         }
 
         if (!running.get()) return fallbackResponse()
         metrics.info("Discovery: próba TCP get_device_state…")
-        return fetchDeviceInfoTcp(upstreamIp, Protocol.CONTROL_PORT) ?: fallbackResponse().also {
+        return fetchDeviceInfoTcp(upstreamIp, Protocol.CONTROL_PORT, net) ?: fallbackResponse().also {
             metrics.error("Discovery: brak danych z teleskopu — używam odpowiedzi zastępczej")
         }
     }
 
     companion object {
-        fun fetchDeviceInfoTcp(ip: InetAddress, port: Int): JSONObject? = try {
-            Socket().use { s ->
-                s.connect(InetSocketAddress(ip, port), 5_000)
+        private const val ANNOUNCE_INTERVAL_MS = 3_000L
+        private const val MAX_SEEN = 32
+
+        fun fetchDeviceInfoTcp(ip: InetAddress, port: Int, net: NetBinder = NetBinder.DEFAULT): JSONObject? = try {
+            connectVia(net, InetSocketAddress(ip, port), 5_000).use { s ->
                 s.soTimeout = 5_000
                 s.getOutputStream().apply {
                     write("{\"id\":999,\"method\":\"get_device_state\",\"params\":[\"verify\"]}\r\n".toByteArray())
@@ -266,9 +347,10 @@ data class FoundTelescope(val ip: String, val sn: String, val model: String, val
 
 /** One-shot LAN scan: broadcast `scan_iscope` from port 4720 and collect replies. */
 object TelescopeScanner {
-    fun scan(timeoutMs: Int = 3_000): List<FoundTelescope> {
+    fun scan(timeoutMs: Int = 3_000, net: NetBinder = NetBinder.DEFAULT): List<FoundTelescope> {
         val found = linkedMapOf<String, FoundTelescope>()
         reusableUdpSocket(InetSocketAddress(Protocol.DISCOVERY_PORT)).use { s ->
+            net.bind(s)
             val ownIps = localIpv4Addresses().map { it.second }.toSet()
             val probe = scanProbe(ownIps.firstOrNull() ?: "0.0.0.0")
             s.send(DatagramPacket(probe, probe.size, BROADCAST, Protocol.DISCOVERY_PORT))

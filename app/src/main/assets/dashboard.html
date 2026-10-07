@@ -33,6 +33,7 @@
     <div class="row"><span><i class="dot" id="cu"></i>Sterowanie (4700)</span><span id="cc">–</span></div>
     <div class="row"><span><i class="dot" id="iu"></i>Obraz (4800)</span><span id="ic">–</span></div>
     <div class="row"><span>Teleskop</span><span id="up">–</span></div>
+    <div class="row"><span>Sieć do teleskopu</span><span id="tn" style="text-align:right;max-width:60%">–</span></div>
     <div class="row"><span>Czas pracy</span><span id="ut">–</span></div>
   </section>
   <section class="card"><h2>Ruch</h2>
@@ -73,6 +74,7 @@ function render(d) {
   $('cc').textContent = d.control.clients + ' klient.';
   $('ic').textContent = d.imaging.clients + ' klient.';
   $('up').textContent = d.upstream || '–';
+  $('tn').textContent = d.telescope_network || '–';
   $('ut').textContent = fmtUp(d.uptime_s);
   $('tx').textContent = d.control.tx; $('rx').textContent = d.control.rx;
   $('ev').textContent = d.control.events; $('fr').textContent = d.imaging.frames;
